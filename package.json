@@ -1,0 +1,27 @@
+{
+  "name": "petrol-app",
+  "version": "1.0.0",
+  "description": "Petrol pump manager server",
+  "main": "server.js",
+  "scripts": {
+    "dev": "node server.js",
+    "build": "node --check server.js registers.js",
+    "lint": "node --check server.js registers.js",
+    "start": "node server.js",
+    "test": "node --test tests/registers.test.js tests/registers.property.test.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "bcryptjs": "3.0.3",
+    "better-sqlite3": "13.0.3",
+    "express": "5.2.1"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "fast-check": "4.10.2"
+  }
+}

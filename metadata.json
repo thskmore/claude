@@ -1,0 +1,8 @@
+{
+  "name": "Petrol Pump Manager",
+  "description": "Comprehensive petrol pump management application for fuel registers, shifts, meter readings, credit sales, inventory, and payroll.",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
