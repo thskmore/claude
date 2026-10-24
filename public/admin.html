@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Super Admin — Petrol Pump Manager Platform</title>
+  <link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --card-sub: #334155;
+      --ink: #f8fafc;
+      --mute: #94a3b8;
+      --line: #334155;
+      --accent: #38bdf8;
+      --accent-soft: rgba(56, 189, 248, 0.12);
+      --due: #f43f5e;
+      --ok: #10b981;
+      --warn: #f59e0b;
+      --radius: 14px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 400 15px/1.5 "Hanken Grotesk", system-ui, sans-serif;
+      padding-bottom: 40px;
+    }
+    .wrap { max-width: 900px; margin: 0 auto; padding: 20px 16px; }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 16px;
+      margin-bottom: 20px;
+      border-bottom: 1px solid var(--line);
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    h1 { font-size: 20px; font-weight: 800; margin: 0; display: flex; align-items: center; gap: 8px; }
+    .badge {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 6px;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+    }
+    .badge.active { background: rgba(16, 185, 129, 0.2); color: #34d399; }
+    .badge.suspended { background: rgba(244, 63, 94, 0.2); color: #fb7185; }
+    .badge.pending_deletion { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    .tabs {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 20px;
+      overflow-x: auto;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 8px;
+    }
+    .tab {
+      background: transparent;
+      border: 0;
+      color: var(--mute);
+      padding: 8px 14px;
+      border-radius: 8px;
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .tab.on { background: var(--card-sub); color: var(--ink); }
+    input, select, textarea {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--line);
+      color: var(--ink);
+      font: inherit;
+      padding: 10px 12px;
+      border-radius: 8px;
+      margin-top: 5px;
+    }
+    input:focus, select:focus, textarea:focus {
+      outline: 2px solid var(--accent);
+      border-color: transparent;
+    }
+    label { display: block; font-size: 13px; color: var(--mute); margin-top: 12px; }
+    button {
+      background: var(--accent);
+      color: #0f172a;
+      border: 0;
+      padding: 10px 16px;
+      border-radius: 8px;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+      transition: filter .15s;
+    }
+    button:hover { filter: brightness(1.1); }
+    button.ghost {
+      background: transparent;
+      color: var(--ink);
+      border: 1px solid var(--line);
+    }
+    button.ghost:hover { background: var(--card-sub); }
+    button.danger {
+      background: rgba(244, 63, 94, 0.2);
+      color: #fb7185;
+      border: 1px solid rgba(244, 63, 94, 0.4);
+    }
+    button.danger:hover { background: rgba(244, 63, 94, 0.3); }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; margin-top: 10px; }
+    th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--line); }
+    th { color: var(--mute); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; font-weight: 700; }
+    .r { text-align: right; }
+    .sub { font-size: 13px; color: var(--mute); }
+    .err { color: var(--due); font-size: 13px; margin-top: 10px; }
+    .msg { color: var(--ok); font-size: 13px; margin-top: 10px; }
+    .row { display: flex; gap: 8px; align-items: center; }
+    .table-box { overflow-x: auto; }
+    #modal {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.7);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 10;
+      padding: 16px;
+    }
+    #modal.on { display: flex; }
+    #modal-box {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 24px;
+      max-width: 480px;
+      width: 100%;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+        Platform Super Admin
+      </h1>
+      <div id="uinfo" class="row"></div>
+    </header>
+
+    <div id="content">Loading platform operator portal...</div>
+  </div>
+
+  <div id="modal">
+    <div id="modal-box"></div>
+  </div>
+
+  <script>
+    let ME = null;
+    let TAB = "stations";
+    let TOKEN = localStorage.getItem("pp_adm_token") || "";
+
+    function authHeader() {
+      const h = { "Content-Type": "application/json", "x-app": "1" };
+      if (TOKEN) h["Authorization"] = "Bearer " + TOKEN;
+      return h;
+    }
+
+    async function api(method, path, body) {
+      const opts = { method, headers: authHeader() };
+      if (body) opts.body = JSON.stringify(body);
+      const res = await fetch(path, opts);
+      const data = await res.json().catch(() => ({ error: "Server returned non-JSON response." }));
+      if (!res.ok) throw data;
+      return data;
+    }
+
+    function esc(s) {
+      return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+    }
+
+    function fmtDate(sec) {
+      if (!sec) return "—";
+      return new Date(sec * 1000).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", dateStyle: "short", timeStyle: "short" });
+    }
+
+    function fmtBytes(b) {
+      if (!b) return "0 B";
+      if (b < 1024) return b + " B";
+      if (b < 1048576) return (b / 1024).toFixed(1) + " KB";
+      return (b / 1048576).toFixed(1) + " MB";
+    }
+
+    function openModal(html) {
+      document.getElementById("modal-box").innerHTML = html;
+      document.getElementById("modal").classList.add("on");
+    }
+    function closeModal() {
+      document.getElementById("modal").classList.remove("on");
+    }
+    document.getElementById("modal").onclick = (e) => {
+      if (e.target.id === "modal") closeModal();
+    };
+
+    async function init() {
+      try {
+        const m = await api("GET", "/api/admin/me");
+        ME = m.admin;
+        if (!ME) {
+          renderLogin(m.none);
+        } else {
+          renderMain();
+        }
+      } catch (e) {
+        renderLogin(false, e.error || "Could not check admin status.");
+      }
+    }
+
+    function renderLogin(none, err) {
+      document.getElementById("uinfo").innerHTML = "";
+      document.getElementById("content").innerHTML = `
+        <div class="card" style="max-width:440px;margin:40px auto">
+          <h2 style="margin-top:0">Platform Operator Login</h2>
+          <div class="sub">Log in with your super admin mobile number and password.</div>
+          ${none ? '<div style="background:rgba(245,158,11,0.15);color:#fbbf24;padding:10px 12px;border-radius:8px;font-size:13px;margin:12px 0">No super admin account exists yet. Run <code>node create-admin.js</code> on the server to create the initial admin.</div>' : ''}
+          <label>Mobile Number (10 digits)
+            <input id="l_mob" inputmode="tel" placeholder="e.g. 9876543210" autocomplete="username">
+          </label>
+          <label>Password
+            <input id="l_pw" type="password" placeholder="••••••••••" autocomplete="current-password">
+          </label>
+          <div class="err" id="l_err">${err ? esc(err) : ""}</div>
+          <button style="width:100%;margin-top:16px" onclick="doLogin()">Log In to Platform</button>
+        </div>
+      `;
+    }
+
+    async function doLogin() {
+      const mobile = document.getElementById("l_mob").value.trim();
+      const password = document.getElementById("l_pw").value;
+      const errBox = document.getElementById("l_err");
+      errBox.textContent = "";
+      try {
+        const res = await api("POST", "/api/admin/login", { mobile, password });
+        ME = res.admin;
+        if (res.token) {
+          TOKEN = res.token;
+          localStorage.setItem("pp_adm_token", TOKEN);
+        }
+        renderMain();
+      } catch (e) {
+        errBox.textContent = e.error || "Login failed.";
+      }
+    }
+
+    async function doLogout() {
+      try { await api("POST", "/api/admin/logout", {}); } catch(e){}
+      ME = null;
+      TOKEN = "";
+      localStorage.removeItem("pp_adm_token");
+      init();
+    }
+
+    function renderMain() {
+      document.getElementById("uinfo").innerHTML = `
+        <span class="sub" style="font-weight:600">${esc(ME.name)} (${esc(ME.mobile)})</span>
+        <button class="ghost" style="padding:6px 12px;font-size:13px" onclick="doLogout()">Log out</button>
+      `;
+
+      let h = `
+        <div class="tabs">
+          <button class="tab ${TAB==='stations'?'on':''}" onclick="TAB='stations';renderMain()">Stations</button>
+          <button class="tab ${TAB==='admins'?'on':''}" onclick="TAB='admins';renderMain()">Admins</button>
+          <button class="tab ${TAB==='audit'?'on':''}" onclick="TAB='audit';renderMain()">Audit Log</button>
+          <button class="tab ${TAB==='pw'?'on':''}" onclick="TAB='pw';renderMain()">Change Password</button>
+        </div>
+        <div id="tab-body">Loading...</div>
+      `;
+      document.getElementById("content").innerHTML = h;
+
+      if (TAB === "stations") loadStations();
+      if (TAB === "admins") loadAdmins();
+      if (TAB === "audit") loadAudit();
+      if (TAB === "pw") renderPasswordTab();
+    }
+
+    async function loadStations() {
+      const b = document.getElementById("tab-body");
+      try {
+        const rows = await api("GET", "/api/admin/stations");
+        if (!rows.length) {
+          b.innerHTML = `<div class="card"><div class="sub">No stations registered yet. Stations appear here when registered.</div></div>`;
+          return;
+        }
+        b.innerHTML = `
+          <div class="card">
+            <h3 style="margin:0 0 12px">Registered Stations (${rows.length})</h3>
+            <div class="table-box">
+              <table>
+                <tr>
+                  <th>Station</th>
+                  <th>Slug / URL</th>
+                  <th>Owner</th>
+                  <th>Status</th>
+                  <th>Database</th>
+                  <th>Registered</th>
+                  <th class="r">Action</th>
+                </tr>
+                ${rows.map(r => `
+                  <tr>
+                    <td><b>${esc(r.name)}</b></td>
+                    <td><code>${esc(r.slug)}</code></td>
+                    <td>${esc(r.owner_mobile)}</td>
+                    <td><span class="badge ${esc(r.status)}">${esc(r.status)}</span></td>
+                    <td>${fmtBytes(r.db_bytes)}</td>
+                    <td>${fmtDate(r.created)}</td>
+                    <td class="r">
+                      ${r.status === 'active' ? `<button class="danger" style="padding:4px 10px;font-size:12px" onclick="stationStatusModal('${esc(r.slug)}', 'suspended')">Suspend</button>` : ''}
+                      ${r.status === 'suspended' ? `<button style="padding:4px 10px;font-size:12px" onclick="stationStatusModal('${esc(r.slug)}', 'active')">Reactivate</button>` : ''}
+                      ${r.status === 'pending_deletion' ? '<span class="sub">Deletion requested</span>' : ''}
+                    </td>
+                  </tr>
+                `).join("")}
+              </table>
+            </div>
+          </div>
+        `;
+      } catch (e) {
+        b.innerHTML = `<div class="err">${esc(e.error || "Failed to load stations.")}</div>`;
+      }
+    }
+
+    function stationStatusModal(slug, to) {
+      openModal(`
+        <h3 style="margin-top:0">${to==='suspended'?'Suspend Station':'Reactivate Station'} (${slug})</h3>
+        <label>Reason (logged in audit trail)
+          <input id="st_reason" placeholder="e.g. Terms violation or billing issue">
+        </label>
+        <div class="err" id="st_err"></div>
+        <div class="row" style="margin-top:16px;justify-content:flex-end">
+          <button class="ghost" onclick="closeModal()">Cancel</button>
+          <button class="${to==='suspended'?'danger':''}" onclick="setStationStatus('${slug}','${to}')">Confirm ${to}</button>
+        </div>
+      `);
+    }
+
+    async function setStationStatus(slug, to) {
+      const reason = document.getElementById("st_reason").value.trim();
+      const errBox = document.getElementById("st_err");
+      try {
+        await api("POST", `/api/admin/stations/${slug}/status`, { status: to, reason });
+        closeModal();
+        loadStations();
+      } catch (e) {
+        errBox.textContent = e.error || "Operation failed.";
+      }
+    }
+
+    async function loadAdmins() {
+      const b = document.getElementById("tab-body");
+      try {
+        const rows = await api("GET", "/api/admin/admins");
+        b.innerHTML = `
+          <div class="card">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+              <h3 style="margin:0">Platform Operators (${rows.length})</h3>
+              <button onclick="newAdminModal()" style="font-size:13px;padding:6px 12px">+ Add Admin</button>
+            </div>
+            <div class="table-box">
+              <table>
+                <tr>
+                  <th>Name</th>
+                  <th>Mobile</th>
+                  <th>Created</th>
+                  <th>Last Login</th>
+                  <th class="r">Action</th>
+                </tr>
+                ${rows.map(r => `
+                  <tr>
+                    <td><b>${esc(r.name)}</b></td>
+                    <td>${esc(r.mobile)}</td>
+                    <td>${fmtDate(r.created)}</td>
+                    <td>${fmtDate(r.last_login)}</td>
+                    <td class="r">
+                      ${r.id !== ME.id ? `<button class="danger" style="padding:4px 10px;font-size:12px" onclick="removeAdminModal(${r.id}, '${esc(r.name)}')">Remove</button>` : '<span class="sub">(You)</span>'}
+                    </td>
+                  </tr>
+                `).join("")}
+              </table>
+            </div>
+          </div>
+        `;
+      } catch (e) {
+        b.innerHTML = `<div class="err">${esc(e.error || "Failed to load admins.")}</div>`;
+      }
+    }
+
+    function newAdminModal() {
+      openModal(`
+        <h3 style="margin-top:0">Create New Platform Admin</h3>
+        <label>Name
+          <input id="na_name" placeholder="Full name">
+        </label>
+        <label>Mobile Number (10 digits)
+          <input id="na_mob" inputmode="tel" placeholder="10-digit mobile number">
+        </label>
+        <label>New Admin Password (10+ characters, 1 letter, 1 digit)
+          <input id="na_pw" type="password" placeholder="••••••••••">
+        </label>
+        <label>Your Admin Password (to confirm authorization)
+          <input id="na_conf" type="password" placeholder="••••••••••">
+        </label>
+        <div class="err" id="na_err"></div>
+        <div class="row" style="margin-top:16px;justify-content:flex-end">
+          <button class="ghost" onclick="closeModal()">Cancel</button>
+          <button onclick="saveAdmin()">Create Admin</button>
+        </div>
+      `);
+    }
+
+    async function saveAdmin() {
+      const name = document.getElementById("na_name").value.trim();
+      const mobile = document.getElementById("na_mob").value.trim();
+      const password = document.getElementById("na_pw").value;
+      const confirm_password = document.getElementById("na_conf").value;
+      const errBox = document.getElementById("na_err");
+      try {
+        await api("POST", "/api/admin/admins", { name, mobile, password, confirm_password });
+        closeModal();
+        loadAdmins();
+      } catch (e) {
+        errBox.textContent = e.error || "Failed to create admin.";
+      }
+    }
+
+    function removeAdminModal(id, name) {
+      openModal(`
+        <h3 style="margin-top:0">Remove Platform Admin</h3>
+        <p class="sub">Are you sure you want to remove <b>${esc(name)}</b>? They will be logged out immediately.</p>
+        <label>Your Admin Password (to confirm)
+          <input id="ra_conf" type="password" placeholder="••••••••••">
+        </label>
+        <div class="err" id="ra_err"></div>
+        <div class="row" style="margin-top:16px;justify-content:flex-end">
+          <button class="ghost" onclick="closeModal()">Cancel</button>
+          <button class="danger" onclick="removeAdmin(${id})">Confirm Removal</button>
+        </div>
+      `);
+    }
+
+    async function removeAdmin(id) {
+      const confirm_password = document.getElementById("ra_conf").value;
+      const errBox = document.getElementById("ra_err");
+      try {
+        await api("POST", `/api/admin/admins/${id}/remove`, { confirm_password });
+        closeModal();
+        loadAdmins();
+      } catch (e) {
+        errBox.textContent = e.error || "Failed to remove admin.";
+      }
+    }
+
+    async function loadAudit() {
+      const b = document.getElementById("tab-body");
+      try {
+        const rows = await api("GET", "/api/admin/audit");
+        b.innerHTML = `
+          <div class="card">
+            <h3 style="margin:0 0 12px">Platform Operator Audit Log (Last 100 actions)</h3>
+            <div class="table-box">
+              <table>
+                <tr>
+                  <th>Time</th>
+                  <th>Admin</th>
+                  <th>Action</th>
+                  <th>Details</th>
+                </tr>
+                ${rows.map(r => `
+                  <tr>
+                    <td style="white-space:nowrap">${fmtDate(r.t)}</td>
+                    <td><b>${esc(r.admin_name || "System")}</b></td>
+                    <td><code>${esc(r.action)}</code></td>
+                    <td>${esc(r.detail)}</td>
+                  </tr>
+                `).join("")}
+              </table>
+            </div>
+          </div>
+        `;
+      } catch (e) {
+        b.innerHTML = `<div class="err">${esc(e.error || "Failed to load audit log.")}</div>`;
+      }
+    }
+
+    function renderPasswordTab() {
+      const b = document.getElementById("tab-body");
+      b.innerHTML = `
+        <div class="card" style="max-width:440px">
+          <h3 style="margin-top:0">Change Super Admin Password</h3>
+          <label>Current Password
+            <input id="pw_cur" type="password" placeholder="••••••••••">
+          </label>
+          <label>New Password (10+ characters, with a letter and a digit)
+            <input id="pw_next" type="password" placeholder="••••••••••">
+          </label>
+          <label>Confirm New Password
+            <input id="pw_next2" type="password" placeholder="••••••••••">
+          </label>
+          <div class="err" id="pw_err"></div>
+          <div class="msg" id="pw_msg"></div>
+          <button style="margin-top:16px" onclick="changePassword()">Update Password</button>
+        </div>
+      `;
+    }
+
+    async function changePassword() {
+      const current = document.getElementById("pw_cur").value;
+      const next = document.getElementById("pw_next").value;
+      const next2 = document.getElementById("pw_next2").value;
+      const errBox = document.getElementById("pw_err");
+      const msgBox = document.getElementById("pw_msg");
+      errBox.textContent = "";
+      msgBox.textContent = "";
+      if (next !== next2) {
+        errBox.textContent = "New passwords do not match.";
+        return;
+      }
+      try {
+        await api("POST", "/api/admin/password", { current, next });
+        msgBox.textContent = "Password changed successfully. Other sessions logged out.";
+        document.getElementById("pw_cur").value = "";
+        document.getElementById("pw_next").value = "";
+        document.getElementById("pw_next2").value = "";
+      } catch (e) {
+        errBox.textContent = e.error || "Failed to change password.";
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>

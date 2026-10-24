@@ -5,29 +5,83 @@ const Database = require("better-sqlite3");
 const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const path = require("path");
+const fs = require("fs");
+const { AsyncLocalStorage } = require("async_hooks");
+const { execFileSync } = require("child_process");
 
 const PORT = +process.env.PORT || 3000;
 const HOST = process.env.HOST || "0.0.0.0";
 const TZ = process.env.TZ_NAME || "Asia/Kolkata";
-const db = new Database(process.env.DB_PATH || path.join(__dirname, "data.db"));
-db.pragma("journal_mode = WAL");
-db.exec(`
-create table if not exists users(
-  id integer primary key, name text not null, mobile text unique not null,
-  hash text not null, role text not null check(role in ('owner','manager','worker')),
-  active integer not null default 1);
-create table if not exists sessions(token text primary key, user_id integer not null, exp integer not null);
-create table if not exists state(id integer primary key check(id = 1), ver integer not null, json text not null);
-create table if not exists credit_sales(
-  id integer primary key, cust_id text not null, d text not null, n text not null,
-  a real not null, veh text, worker_id integer not null, created integer not null,
-  status text not null default 'ok');
-`);
-if (!db.prepare("pragma table_info(credit_sales)").all().some((c) => c.name === "status"))
-  db.exec("alter table credit_sales add column status text not null default 'ok'");
 
-addColLang();
-function addColLang() { if (!db.prepare("pragma table_info(users)").all().some((c) => c.name === "lang")) db.exec("alter table users add column lang text not null default 'en'"); }
+// Multi-station: each station has its own database file. The registry lists the stations.
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+const STATIONS_DIR = path.join(DATA_DIR, "stations");
+const TEMPLATE_DB = path.join(DATA_DIR, "station-template.db");
+fs.mkdirSync(STATIONS_DIR, { recursive: true });
+const als = new AsyncLocalStorage();
+const defaultDb = new Database(process.env.DB_PATH || path.join(__dirname, "data.db"));
+defaultDb.pragma("journal_mode = WAL");
+const stationDbs = new Map();
+function openStationDb(slug) {
+  if (!stationDbs.has(slug)) {
+    const d = new Database(path.join(STATIONS_DIR, slug + ".db"));
+    d.pragma("journal_mode = WAL");
+    stationDbs.set(slug, d);
+  }
+  return stationDbs.get(slug);
+}
+// Every query runs against the station of the current request (or the default database when no station is in use).
+const db = new Proxy({}, {
+  get(_, p) {
+    const cur = als.getStore();
+    const real = cur && cur.db ? cur.db : defaultDb;
+    const v = real[p];
+    return typeof v === "function" ? v.bind(real) : v;
+  }
+});
+const REG = new Database(path.join(DATA_DIR, "registry.db"));
+REG.exec(`create table if not exists stations(slug text primary key, name text not null, status text not null default 'active', owner_mobile text, created integer not null, consent_at integer, notice_version text, deletion_requested integer);`);
+
+function initStationSchema(targetDb) {
+  targetDb.exec(`
+    create table if not exists users(
+      id integer primary key, name text not null, mobile text unique not null,
+      hash text not null, role text not null check(role in ('owner','manager','accountant','worker')),
+      active integer not null default 1, lang text not null default 'en');
+    create table if not exists sessions(token text primary key, user_id integer not null, exp integer not null);
+    create table if not exists state(id integer primary key check(id = 1), ver integer not null, json text not null);
+    create table if not exists credit_sales(
+      id integer primary key, cust_id text not null, d text not null, n text not null,
+      a real not null, veh text, worker_id integer not null, created integer not null,
+      status text not null default 'ok');
+  `);
+  if (!targetDb.prepare("pragma table_info(credit_sales)").all().some((c) => c.name === "status"))
+    targetDb.exec("alter table credit_sales add column status text not null default 'ok'");
+  if (!targetDb.prepare("pragma table_info(users)").all().some((c) => c.name === "lang"))
+    targetDb.exec("alter table users add column lang text not null default 'en'");
+
+  const userSql = (targetDb.prepare("select sql from sqlite_master where type='table' and name='users'").get() || {}).sql || "";
+  if (userSql && !userSql.includes("'accountant'")) {
+    targetDb.exec(`
+      pragma foreign_keys = off;
+      create table if not exists users_new(
+        id integer primary key, name text not null, mobile text unique not null,
+        hash text not null, role text not null check(role in ('owner','manager','accountant','worker')),
+        active integer not null default 1, lang text not null default 'en');
+      insert into users_new select id, name, mobile, hash, role, active, coalesce(lang, 'en') from users;
+      drop table users;
+      alter table users_new rename to users;
+      pragma foreign_keys = on;
+    `);
+  }
+}
+initStationSchema(defaultDb);
+
+function ensureTemplate() {
+  if (fs.existsSync(TEMPLATE_DB)) return;
+  execFileSync(process.execPath, [__filename], { env: { ...process.env, DB_PATH: TEMPLATE_DB, DATA_DIR, INIT_ONLY: "1" } });
+}
+
 const app = express();
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
@@ -37,11 +91,46 @@ app.use((q, s, n) => {
     "Referrer-Policy": "same-origin",
     "Cache-Control": "no-store",
     "Content-Security-Policy":
-      "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob: https:; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com; img-src 'self' data: blob: https:; connect-src 'self' *;",
+      "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self';",
   });
   n();
 });
+function stationSlug(q) {
+  const base = process.env.BASE_DOMAIN;
+  if (base && q.hostname && q.hostname.endsWith("." + base)) return q.hostname.slice(0, -(base.length + 1)).split(".").pop();
+  const param = q.query && q.query.station;
+  if (param && /^[a-z0-9-]{3,30}$/.test(String(param))) return String(param);
+  const m = String(q.headers.cookie || "").match(/(?:^|;\s*)ps_station=([a-z0-9-]{3,30})/);
+  return m ? m[1] : null;
+}
+const SIGNUP_OPEN = () => process.env.SIGNUP_ENABLED === "1";
+const NO_STATION_PATHS = ["/api/stations", "/api/station/enter", "/api/station/leave"];
+const STATION_COOKIE_OFF = "ps_station=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0";
+app.use((q, s, n) => {
+  const saas = SIGNUP_OPEN() || REG.prepare("select count(*) n from stations").get().n > 0;
+  if (!saas) return n(); // single-station mode: default database, as before
+  if (NO_STATION_PATHS.includes(q.path) || q.path.startsWith("/api/admin/") || q.path === "/admin") return n(); // platform admin routes use registry only
+  const slug = stationSlug(q);
+  const row = slug ? REG.prepare("select * from stations where slug=?").get(slug) : null;
+  if (!row || row.status !== "active") {
+    if (q.path === "/api/me") {
+      if (slug) s.setHeader("Set-Cookie", STATION_COOKIE_OFF);
+      return s.json({ user: null, setup: false, stations: true, signup: SIGNUP_OPEN(), privacy_contact: process.env.PRIVACY_CONTACT || "" });
+    }
+    if (q.path.startsWith("/api/")) return s.status(!slug ? 409 : row ? 403 : 404).json({ error: !slug ? "Choose your station first." : row ? "This station is not active." : "Station not found." });
+    return n();
+  }
+  als.run({ db: openStationDb(row.slug), station: row }, n);
+});
 app.use(express.json({ limit: "8mb" }));
+// Normalize trailing slashes on all incoming requests
+app.use((q, s, n) => {
+  if (q.path.length > 1 && q.path.endsWith("/")) {
+    const query = q.url.slice(q.path.length);
+    q.url = q.path.slice(0, -1) + query;
+  }
+  n();
+});
 // CSRF guard: every state-changing call must carry a custom header a cross-site form cannot send.
 app.use((q, s, n) => {
   if (q.method !== "GET" && q.method !== "HEAD" && q.get("x-app") !== "1") return s.status(403).json({ error: "Forbidden." });
@@ -59,10 +148,18 @@ app.use((q, s, n) => {
 
 const now = () => Math.floor(Date.now() / 1000);
 const DAY = 86400;
+const SESSION_TTL = process.env.SESSION_MAX_AGE_DAYS
+  ? (parseInt(process.env.SESSION_MAX_AGE_DAYS, 10) || 1) * DAY
+  : DAY;
 const hs = (t) => crypto.createHash("sha256").update(t).digest("hex");
 const mob = (x) => String(x || "").replace(/\D/g, "").slice(-10);
 const pub = (u) => ({ id: u.id, name: u.name, mobile: u.mobile, role: u.role, lang: u.lang || "en" });
 const today = () => new Date().toLocaleDateString("en-CA", { timeZone: TZ });
+const bizDate = () => new Date(Date.now() - 6 * 3600e3).toLocaleDateString("en-CA", { timeZone: TZ });
+const monthOf = (m) => (/^\d{4}-(0[1-9]|1[0-2])$/.test(m || "") ? m : today().slice(0, 7));
+const SHIFTS = ["Morning", "Evening", "Night"];
+const r2 = (x) => Math.round((+x + Number.EPSILON) * 100) / 100;
+const num = (x) => { if (x === "" || x === null || x === undefined) return NaN; const n = +x; return Number.isFinite(n) && n >= 0 && n < 1e9 ? n : NaN; };
 const usersCount = () => db.prepare("select count(*) n from users").get().n;
 
 function cookie(q, k) {
@@ -93,10 +190,10 @@ const need = (...roles) => (q, s, n) => {
 };
 function startSession(q, s, uid) {
   const t = crypto.randomBytes(32).toString("hex");
-  db.prepare("insert into sessions values(?,?,?)").run(hs(t), uid, now() + 7 * DAY);
+  db.prepare("insert into sessions values(?,?,?)").run(hs(t), uid, now() + SESSION_TTL);
   const isSecure = q.secure || q.headers["x-forwarded-proto"] === "https";
   const cookieOpts = isSecure ? "SameSite=None; Secure; Partitioned" : "SameSite=Lax";
-  s.setHeader("Set-Cookie", `sid=${t}; HttpOnly; ${cookieOpts}; Path=/; Max-Age=${7 * DAY}`);
+  s.setHeader("Set-Cookie", `sid=${t}; HttpOnly; ${cookieOpts}; Path=/; Max-Age=${SESSION_TTL}`);
   return t;
 }
 function checkUser(name, m, pw) {
@@ -115,7 +212,15 @@ const clearFail = (k) => db.prepare("delete from login_fails where k=?").run(k);
 
 app.get("/api/me", (q, s) => {
   const u = getUser(q);
-  s.json({ user: u ? pub(u) : null, setup: usersCount() === 0, biz: bizDate() });
+  const stn = (als.getStore() || {}).station;
+  s.json({
+    user: u ? pub(u) : null,
+    setup: usersCount() === 0,
+    biz: bizDate(),
+    station: stn ? { slug: stn.slug, name: stn.name } : null,
+    signup: SIGNUP_OPEN(),
+    privacy_contact: process.env.PRIVACY_CONTACT || "",
+  });
 });
 app.post("/api/setup", (q, s) => {
   if (usersCount() > 0) return s.status(403).json({ error: "Setup is already done." });
@@ -178,7 +283,7 @@ app.get("/api/users", need("owner", "manager"), (q, s) =>
 app.post("/api/users", need("owner", "manager"), (q, s) => {
   const { name, mobile, password, role } = q.body || {};
   const m = mob(mobile);
-  if (!["manager", "worker"].includes(role)) return s.status(400).json({ error: "Choose manager or worker." });
+  if (!["manager", "accountant", "worker"].includes(role)) return s.status(400).json({ error: "Choose manager, accountant or worker." });
   if (q.user.role === "manager" && role !== "worker") return s.status(403).json({ error: "Managers can add workers only." });
   const e = checkUser(name, m, password);
   if (e) return s.status(400).json({ error: e });
@@ -190,7 +295,7 @@ app.patch("/api/users/:id", need("owner", "manager"), (q, s) => {
   const id = +q.params.id, u = db.prepare("select * from users where id=?").get(id);
   if (!u) return s.status(404).json({ error: "User not found." });
   if (q.user.role === "manager" && u.role !== "worker") return s.status(403).json({ error: "Managers can change workers only." });
-  const { active, password, name } = q.body || {};
+  const { active, password, name, role } = q.body || {};
   if (active !== undefined) {
     if (u.id === q.user.id) return s.status(400).json({ error: "You cannot deactivate your own account." });
     db.prepare("update users set active=? where id=?").run(active ? 1 : 0, id);
@@ -200,6 +305,10 @@ app.patch("/api/users/:id", need("owner", "manager"), (q, s) => {
     if (typeof password !== "string" || password.length < 6 || password.length > 100) return s.status(400).json({ error: "Password must be at least 6 characters." });
     db.prepare("update users set hash=? where id=?").run(bcrypt.hashSync(password, 10), id);
     db.prepare("delete from sessions where user_id=?").run(id);
+  }
+  if (role !== undefined && q.user.role === "owner" && u.role !== "owner") {
+    if (!["manager", "accountant", "worker"].includes(role)) return s.status(400).json({ error: "Choose manager, accountant or worker." });
+    db.prepare("update users set role=? where id=?").run(role, id);
   }
   if (name !== undefined && String(name).trim()) db.prepare("update users set name=? where id=?").run(String(name).trim().slice(0, 60), id);
   s.json({ ok: true });
@@ -273,7 +382,7 @@ function diffSummary(before, after) {
   }
   return out.join("; ");
 }
-app.get("/api/state", need("owner", "manager"), (q, s) => {
+app.get("/api/state", need("owner", "manager", "accountant"), (q, s) => {
   const { state, vers } = readSections();
   s.json(Object.keys(vers).length ? { vers, state } : { vers: {}, state: null });
 });
@@ -367,7 +476,7 @@ app.post("/api/credit-sales", need(), (q, s) => {
     .run(String(c.id), bizDate(), item, amt, String(veh || "").trim().toUpperCase().slice(0, 20), q.user.id, now(), status, fu || null, lt, cid || null).lastInsertRowid;
   s.json({ id, pending: status === "pending", available: Math.round((status === "ok" ? c.available - amt : c.available) * 100) / 100 });
 });
-app.get("/api/credit-sales", need("owner", "manager"), (q, s) =>
+app.get("/api/credit-sales", need("owner", "manager", "accountant"), (q, s) =>
   s.json(db.prepare("select cs.id,cs.cust_id,cs.d,cs.n,cs.a,cs.veh,cs.fuel,cs.litres,cs.status,u.name worker from credit_sales cs join users u on u.id=cs.worker_id where cs.status<>'rejected' order by cs.id").all()));
 app.get("/api/my-credit-sales", need(), (q, s) => {
   const names = {};
@@ -416,10 +525,6 @@ addCol("credit_sales", "fuel", "text");
 addCol("credit_sales", "litres", "real");
 addCol("credit_sales", "cid", "text");
 
-const r2 = (x) => Math.round(x * 100) / 100;
-const num = (x) => { if (x === "" || x === null || x === undefined) return NaN; const n = +x; return Number.isFinite(n) && n >= 0 && n < 1e9 ? n : NaN; };
-// The business day starts at 6 AM: a night shift that runs past midnight belongs to the previous day.
-const bizDate = () => new Date(Date.now() - 6 * 3600e3).toLocaleDateString("en-CA", { timeZone: TZ });
 const DEFMODES = [{ key: "cash", name: "Cash", active: true }, { key: "upi", name: "UPI", active: true }, { key: "card", name: "Card", active: true }];
 const allModes = (st) => (st.paymodes && st.paymodes.length ? st.paymodes : DEFMODES);
 const activeModes = (st) => allModes(st).filter((m) => m.active !== false || m.key === "cash");
@@ -660,7 +765,7 @@ app.delete("/api/duties/:id", need("owner", "manager"), (q, s) => {
   if (!r) return s.status(404).json({ error: "Only a duty that has not been submitted can be cancelled." });
   s.json({ ok: true });
 });
-app.get("/api/duties", need("owner", "manager"), (q, s) => {
+app.get("/api/duties", need("owner", "manager", "accountant"), (q, s) => {
   const d = /^\d{4}-\d{2}-\d{2}$/.test(q.query.d || "") ? q.query.d : bizDate();
   s.json({
     day: db.prepare("select * from duties where d=? and status<>'open' order by id").all(d).map(detail),
@@ -669,13 +774,13 @@ app.get("/api/duties", need("owner", "manager"), (q, s) => {
     day_status: dayStatus(d),
   });
 });
-app.get("/api/duties/:id", need("owner", "manager"), (q, s) => {
+app.get("/api/duties/:id", need("owner", "manager", "accountant"), (q, s) => {
   const d = db.prepare("select * from duties where id=? and status<>'open'").get(+q.params.id);
   if (!d) return s.status(404).json({ error: "Duty not found." });
   s.json(detail(d));
 });
 app.put("/api/duties/:id", need("owner", "manager"), (q, s) => {
-  if (q.user.role === "manager") return s.status(403).json({ error: "A manager cannot change a duty. Send it back for correction, or close it as it stands." });
+  if (q.user.role === "manager" || q.user.role === "accountant") return s.status(403).json({ error: "Only the owner can change a duty. Send it back for correction, or close it as it stands." });
   const d = db.prepare("select * from duties where id=? and status='submitted'").get(+q.params.id);
   if (!d) return s.status(404).json({ error: "Only duties waiting to be closed can be changed." });
   const before = detail(d), e = saveDuty(d.id, q.body || {}, true, true);
@@ -745,7 +850,7 @@ function dayVerifyState(d, st) {
   });
   return { exp, modes, checks, missing };
 }
-app.get("/api/days/:d/verify", need("owner", "manager"), (q, s) => {
+app.get("/api/days/:d/verify", need("owner", "manager", "accountant"), (q, s) => {
   const st = stateNow(), v = dayVerifyState(q.params.d, st);
   s.json({ d: q.params.d, expected: v.exp, modes: v.modes, checks: v.checks, complete: v.missing.length === 0 });
 });
@@ -793,7 +898,7 @@ function finDay(d, st, T, pay) {
   const cf = cashFlowRows(st, d).rows.find((x) => x.d === d);
   return { fuelSales: r2(T.sales), lubeSales: r2(T.lube), shopSales, totalSales: r2(T.sales + T.lube + shopSales), creditNew, creditRecovery: r2(recovery), collectedDuties: pay, dutyExpenses: r2(T.exp), managerExpenses: mgrExp, bankDeposits: deposits, cashInHand: cf ? cf.close : null };
 }
-app.get("/api/day-report", need("owner", "manager"), (q, s) => {
+app.get("/api/day-report", need("owner", "manager", "accountant"), (q, s) => {
   const d = validDay(q.query.d) ? q.query.d : bizDate(), st = stateNow();
   const duties = db.prepare("select * from duties where d=? and status='closed' order by id").all(d).map(detail);
   const fuel = {}, shop = {}, exps = {}, pay = {};
@@ -811,7 +916,7 @@ app.get("/api/day-report", need("owner", "manager"), (q, s) => {
 });
 
 // Money from closed business days: collections by mode, fuel and shop sales, expenses (for the Book and Reports)
-app.get("/api/duty-money", need("owner", "manager"), (q, s) => {
+app.get("/api/duty-money", need("owner", "manager", "accountant"), (q, s) => {
   const f = validDay(q.query.from) ? q.query.from : "0000-01-01", t = validDay(q.query.to) ? q.query.to : "9999-12-31";
   const days = db.prepare("select distinct d from duties where status='closed' and d>=? and d<=? order by d").all(f, t);
   s.json(days.map(({ d }) => {
@@ -830,7 +935,7 @@ app.get("/api/duty-money", need("owner", "manager"), (q, s) => {
 });
 
 // Closed duties with their sales and cash difference, for the shortage report
-app.get("/api/shortage-data", need("owner", "manager"), (q, s) => {
+app.get("/api/shortage-data", need("owner", "manager", "accountant"), (q, s) => {
   const f = validDay(q.query.from) ? q.query.from : "0000-01-01", t = validDay(q.query.to) ? q.query.to : "9999-12-31";
   s.json(db.prepare("select * from duties where status='closed' and d>=? and d<=? order by d,id").all(f, t).map(detail)
     .map((x) => ({ id: x.id, d: x.d, shift: x.shift, worker_id: x.worker_id, worker: x.worker, sales: r2(x.sales + x.lube), diff: x.diff })));
@@ -960,6 +1065,9 @@ app.post("/api/dips", need(), (q, s) => {
   if (cid) { const ex = db.prepare("select id,litres from dips where cid=? and user_id=?").get(cid, q.user.id); if (ex) return s.json({ id: ex.id, litres: ex.litres }); }
   const tank = (stateNow().tanks || []).find((t) => String(t.id) === String(b.tank_id));
   if (!tank) return s.status(400).json({ error: "Choose a tank." });
+  if (b.litres !== undefined && b.litres !== null && b.litres !== "" && +b.litres < 0) {
+    return s.status(400).json({ error: "The litres reading cannot be negative." });
+  }
   let litres = num(b.litres);
   const dip = b.dip === "" || b.dip == null ? null : num(b.dip);
   if (Number.isNaN(litres)) {
@@ -968,9 +1076,9 @@ app.post("/api/dips", need(), (q, s) => {
     if (r.err) return s.status(400).json({ error: r.err });
     litres = r.l;
   }
+  if (litres < 0) return s.status(400).json({ error: "The litres reading cannot be negative." });
   if (tank.capacity && litres > tank.capacity * 1.02) return s.status(400).json({ error: `That is more than the tank capacity (${tank.capacity} L). Check the reading.` });
-  const dobs = null, tmp = null, d15 = null; // density is recorded on the morning reading only
-  if (d15 == null && dobs != null && tmp != null) d15 = density15(dobs, tmp);
+  const dobs = null, tmp = null, d15 = null; // density is recorded separately via /api/density/morning
   if (dip !== null && (Number.isNaN(dip) || dip < 0)) return s.status(400).json({ error: "A dip reading cannot be negative." });
   const purpose = "morning";
   let bd = new Date(now() * 1000 - 6 * 3600e3).toLocaleDateString("en-CA", { timeZone: TZ });
@@ -992,7 +1100,7 @@ function densFlags(cfg, r) {
   if (r.inv != null && Math.abs(v - r.inv) > cfg.tol + 1e-9) f.push(`Differs from the chalan density by ${(Math.abs(v - r.inv)).toFixed(1)} (limit ${cfg.tol})`);
   return f;
 }
-app.get("/api/density", need("owner", "manager"), (q, s) => {
+app.get("/api/density", need("owner", "manager", "accountant"), (q, s) => {
   const st = stateNow(), tanks = {}, rows = [], nn = (x) => (x === "" || x == null || !Number.isFinite(+x) ? null : +x);
   (st.tanks || []).forEach((t) => (tanks[String(t.id)] = t));
   (st.deliv || []).forEach((d) => (d.lines || []).forEach((l) => {
@@ -1013,7 +1121,7 @@ app.get("/api/density", need("owner", "manager"), (q, s) => {
   s.json(rows.slice(0, 80));
 });
 // ---- Stock and density registers (one per fuel, by month)
-app.get("/api/registers", need("owner", "manager"), (q, s) => {
+app.get("/api/registers", need("owner", "manager", "accountant"), (q, s) => {
   const st = stateNow(), all = st.tanks || [], fuels = [...new Set([...all.map((t) => t.fuel), ...(st.nozzles || []).map((n) => n.fuel)].filter(Boolean))];
   const month = /^\d{4}-(0[1-9]|1[0-2])$/.test(q.query.month || "") ? q.query.month : bizDate().slice(0, 7);
   const fuel = fuels.includes(q.query.fuel) ? q.query.fuel : fuels[0] || "";
@@ -1114,7 +1222,7 @@ function cashFlowRows(st, last) {
   });
   return { start: cf.start, open: open0, rows };
 }
-app.get("/api/cashflow", need("owner", "manager"), (q, s) => {
+app.get("/api/cashflow", need("owner", "manager", "accountant"), (q, s) => {
   const month = cfMonth(q.query.month), st = stateNow();
   const last = daysOfMonth(month).slice(-1)[0];
   const cr = cashFlowRows(st, last);
@@ -1199,15 +1307,15 @@ app.get("/api/dashboard", need(), (q, s) => {
     shortages: { count: monthShort.length, amount: sum(monthShort, (x) => -x.diff), month: cfMonth() },
     cash: null,
   };
-  if (me.role === "owner" || me.role === "manager") out.licences = licSummary(licRows());
-  if (me.role === "owner" || me.role === "manager") {
+  if (me.role === "owner" || me.role === "manager" || me.role === "accountant") out.licences = licSummary(licRows());
+  if (me.role === "owner" || me.role === "manager" || me.role === "accountant") {
     const cr = cashFlowRows(st, today);
     out.cash = { start: cr.start, open: cr.open, closing: cr.rows.length ? cr.rows[cr.rows.length - 1].close : cr.open };
   }
   s.json(out);
 });
 // ---- Expenses register: workers' duty expenses and the manager's Book expenses, one list
-app.get("/api/expenses", need("owner", "manager"), (q, s) => {
+app.get("/api/expenses", need("owner", "manager", "accountant"), (q, s) => {
   const month = cfMonth(q.query.month), st = stateNow();
   const duty = db.prepare("select de.cat, de.note, de.amount, d.d, d.shift, d.status, u.name worker from duty_expenses de join duties d on d.id=de.duty_id join users u on u.id=d.worker_id where d.status<>'open' and substr(d.d,1,7)=? order by d.d, d.id, de.id").all(month)
     .map((x) => ({ d: x.d, source: "Duty", who: x.worker, detail: x.shift + " duty" + (x.note ? " \u00b7 " + x.note : ""), cat: x.cat || "Other", mode: "Till", amount: r2(x.amount), status: x.status === "closed" ? "Closed" : "Waiting for manager" }));
@@ -1261,7 +1369,7 @@ function atgReport(st, from, to) {
     return { id: t.id, name: t.name, fuel: t.fuel, rows };
   });
 }
-app.get("/api/atg", need("owner", "manager"), (q, s) => {
+app.get("/api/atg", need("owner", "manager", "accountant"), (q, s) => {
   const month = cfMonth(q.query.month), st = stateNow();
   const from = month + "-01", to = daysOfMonth(month).slice(-1)[0];
   const today = bizDate();
@@ -1306,7 +1414,7 @@ function licSummary(rows) {
   return { tracked: rows.length, expired: rows.filter((x) => x.status === "expired").length, soon30: rows.filter((x) => x.status === "soon30").length, soon90: rows.filter((x) => x.status === "soon90").length, noCopy: rows.filter((x) => !x.hasDoc).length };
 }
 const isDay = (x) => /^\d{4}-\d{2}-\d{2}$/.test(x || "") && !Number.isNaN(Date.parse(x + "T00:00:00Z"));
-app.get("/api/licences", need("owner", "manager"), (q, s) => {
+app.get("/api/licences", need("owner", "manager", "accountant"), (q, s) => {
   const rows = licRows();
   s.json({ licences: rows, summary: licSummary(rows), suggestions: LIC_SUGGEST });
 });
@@ -1355,7 +1463,7 @@ app.delete("/api/licences/:id", need("owner", "manager"), (q, s) => {
   audit(q.user, "licence", `Licence removed: ${r.name}`);
   s.json({ ok: true });
 });
-app.get("/api/licences/:id/doc", need("owner", "manager"), (q, s) => {
+app.get("/api/licences/:id/doc", need("owner", "manager", "accountant"), (q, s) => {
   const r = db.prepare("select doc_name,doc_type,doc_data from licences where id=?").get(+q.params.id);
   if (!r || !r.doc_data) return s.status(404).json({ error: "No copy attached." });
   const buf = Buffer.from(r.doc_data, "base64");
@@ -1392,11 +1500,11 @@ app.get("/api/daily-required", need(), (q, s) => {
     const pend = db.prepare("select count(*) n from credit_sales where status='pending'").get().n;
     items.push({ label: "Credit sales waiting for approval", done: pend === 0, detail: pend ? `${pend} waiting` : "None waiting." });
     const lic = licRows().filter((x) => x.status === "expired" || x.status === "soon30");
-    if (me.role === "owner" || me.role === "manager") items.push({ label: "Licences due within 30 days", done: lic.length === 0, detail: lic.length ? lic.map((x) => x.name).join(", ") : "None due." });
+    if (me.role === "owner" || me.role === "manager" || me.role === "accountant") items.push({ label: "Licences due within 30 days", done: lic.length === 0, detail: lic.length ? lic.map((x) => x.name).join(", ") : "None due." });
   }
   s.json({ today, role: me.role, items, done: items.filter((x) => x.done).length, total: items.length });
 });
-app.get("/api/stock-check", need("owner", "manager"), (q, s) => s.json(tankChecks()));
+app.get("/api/stock-check", need("owner", "manager", "accountant"), (q, s) => s.json(tankChecks()));
 app.delete("/api/dips/:id", need("owner", "manager"), (q, s) => {
   db.prepare("delete from dips where id=?").run(+q.params.id);
   s.json({ ok: true });
@@ -1410,8 +1518,6 @@ create table if not exists pay_items(
   kind text not null check(kind in ('advance','bonus','waive','paid')),
   amount real not null, note text, d text not null, created integer not null);
 `);
-const SHIFTS = ["Morning", "Evening", "Night"];
-const monthOf = (m) => (/^\d{4}-(0[1-9]|1[0-2])$/.test(m || "") ? m : today().slice(0, 7));
 function payFor(u, month) {
   const rates = {};
   db.prepare("select shift,rate from pay_rates where worker_id=?").all(u.id).forEach((r) => (rates[r.shift] = r.rate));
@@ -1438,7 +1544,7 @@ function payFor(u, month) {
   const net = r2(earn + bonus + excess - advance - Math.max(0, short - waived));
   return { id: u.id, name: u.name, role: u.role, rates, count, duties: shiftsPaid.size, pending, missing_rate: missing, earn, short, excess, advance, bonus, waived, paid, net, balance: r2(net - paid), items };
 }
-app.get("/api/payroll", need("owner"), (q, s) => {
+app.get("/api/payroll", need("owner", "accountant"), (q, s) => {
   const m = monthOf(q.query.month);
   const us = db.prepare("select id,name,role from users where role='worker' or id in (select worker_id from duties where substr(d,1,7)=?) order by name").all(m);
   s.json({ month: m, workers: us.map((u) => payFor(u, m)) });
@@ -1481,7 +1587,7 @@ app.get("/api/my-pay", need(), (q, s) => {
 // ---- Daily summary text (for the owner's WhatsApp)
 const R0 = (n) => "\u20b9" + Math.round(n).toLocaleString("en-IN");
 const L1 = (n) => (Math.round(n * 10) / 10).toLocaleString("en-IN") + " L";
-app.get("/api/daily-summary", need("owner", "manager"), (q, s) => {
+app.get("/api/daily-summary", need("owner", "manager", "accountant"), (q, s) => {
   const d = /^\d{4}-\d{2}-\d{2}$/.test(q.query.d || "") ? q.query.d : bizDate();
   const st = stateNow(), biz = st.biz || {};
   const ds = db.prepare("select * from duties where d=? and status in ('submitted','closed') order by id").all(d).map(detail);
@@ -1538,43 +1644,74 @@ app.get("/api/daily-summary", need("owner", "manager"), (q, s) => {
 });
 
 // ---- Server backups (owner): a nightly copy of the whole database, plus restore
-const fs = require("fs");
-const BACKUP_DIR = process.env.BACKUP_DIR || path.join(__dirname, "backups");
+// Note: BACKUP_DIR is isolated from the static web root (/public) and cannot be reached via static routes.
+const BACKUP_DIR = process.env.BACKUP_DIR ? path.resolve(process.env.BACKUP_DIR) : path.join(__dirname, "backups");
 fs.mkdirSync(BACKUP_DIR, { recursive: true });
 const BK_NAME = /^[A-Za-z0-9._-]+\.db$/;
+
+// A station's backups live in its own folder, so one station can never list, download or restore another's.
+function bkDir() {
+  const st = als.getStore();
+  const d = st && st.station ? path.join(BACKUP_DIR, st.station.slug) : BACKUP_DIR;
+  fs.mkdirSync(d, { recursive: true });
+  return d;
+}
+
+function safeBackupPath(rawName) {
+  const name = path.basename(String(rawName || ""));
+  if (!BK_NAME.test(name)) return null;
+  const baseDir = bkDir();
+  const full = path.resolve(baseDir, name);
+  if (!full.startsWith(baseDir + path.sep) && full !== baseDir) return null;
+  return full;
+}
+
 async function makeBackup(name) {
-  await db.backup(path.join(BACKUP_DIR, name));
-  const files = fs.readdirSync(BACKUP_DIR).filter((f) => BK_NAME.test(f)).map((f) => ({ f, t: fs.statSync(path.join(BACKUP_DIR, f)).mtimeMs })).sort((a, b) => b.t - a.t);
-  files.slice(30).forEach((x) => fs.unlinkSync(path.join(BACKUP_DIR, x.f)));
+  const target = safeBackupPath(name);
+  if (!target) throw new Error("Invalid backup name");
+  await db.backup(target);
+  const dir = bkDir();
+  const files = fs.readdirSync(dir).filter((f) => BK_NAME.test(f)).map((f) => ({ f, t: fs.statSync(path.join(dir, f)).mtimeMs })).sort((a, b) => b.t - a.t);
+  files.slice(30).forEach((x) => fs.unlinkSync(path.join(dir, x.f)));
   return name;
 }
 const stamp = () => new Date().toLocaleString("sv-SE", { timeZone: TZ }).replace(/[: ]/g, "-").slice(0, 16);
 function nightlyBackup() {
   const hour = +new Date().toLocaleString("en-GB", { timeZone: TZ, hour: "2-digit", hour12: false }), name = `data-${today()}.db`;
-  if (hour < 2 || fs.existsSync(path.join(BACKUP_DIR, name))) return;
-  makeBackup(name).then(() => audit(null, "backup", `Nightly backup ${name}`)).catch((e) => console.error("Nightly backup failed:", e.message));
+  if (hour < 2 && process.env.BACKUP_ANYTIME !== "1") return;
+  const targets = [{}]; // defaultDb
+  try {
+    REG.prepare("select * from stations where status='active'").all().forEach((r) => targets.push({ db: openStationDb(r.slug), station: r }));
+  } catch (e) {}
+  targets.forEach((store) => als.run(store, () => {
+    if (fs.existsSync(path.join(bkDir(), name))) return;
+    makeBackup(name).then(() => audit(null, "backup", `Nightly backup ${name}`)).catch((e) => console.error("Nightly backup failed:", e.message));
+  }));
 }
 setInterval(nightlyBackup, 10 * 60e3).unref();
 setTimeout(nightlyBackup, 5000).unref();
 app.get("/api/backups", need("owner"), (q, s) => {
-  s.json(fs.readdirSync(BACKUP_DIR).filter((f) => BK_NAME.test(f)).map((f) => { const st = fs.statSync(path.join(BACKUP_DIR, f)); return { name: f, size: st.size, t: Math.floor(st.mtimeMs / 1000) }; }).sort((a, b) => b.t - a.t));
+  const dir = bkDir();
+  s.json(fs.readdirSync(dir).filter((f) => BK_NAME.test(f)).map((f) => { const st = fs.statSync(path.join(dir, f)); return { name: f, size: st.size, t: Math.floor(st.mtimeMs / 1000) }; }).sort((a, b) => b.t - a.t));
 });
 app.post("/api/backups/run", need("owner"), (q, s) => {
   const name = `data-manual-${stamp()}.db`;
   makeBackup(name).then(() => { audit(q.user, "backup", `Manual backup ${name}`); s.json({ name }); }).catch(() => s.status(500).json({ error: "Backup failed." }));
 });
 app.get("/api/backups/:name", need("owner"), (q, s) => {
-  if (!BK_NAME.test(q.params.name) || !fs.existsSync(path.join(BACKUP_DIR, q.params.name))) return s.status(404).json({ error: "Backup not found." });
-  s.download(path.join(BACKUP_DIR, q.params.name));
+  const full = safeBackupPath(q.params.name);
+  if (!full || !fs.existsSync(full)) return s.status(404).json({ error: "Backup not found." });
+  s.download(full);
 });
 // Restore copies every table from the chosen backup over the live data. A safety copy is taken first.
 const RESTORE_TABLES = ["users", "sections", "state", "audit", "credit_sales", "duties", "duty_lines", "duty_items", "duty_expenses", "days", "dips", "pay_rates", "pay_items"];
 app.post("/api/backups/restore", need("owner"), async (q, s) => {
-  const name = q.body && q.body.name;
-  if (!BK_NAME.test(String(name)) || !fs.existsSync(path.join(BACKUP_DIR, name))) return s.status(404).json({ error: "Backup not found." });
+  const full = safeBackupPath(q.body && q.body.name);
+  if (!full || !fs.existsSync(full)) return s.status(404).json({ error: "Backup not found." });
+  const name = path.basename(full);
   try {
     await makeBackup(`data-before-restore-${stamp()}.db`);
-    db.prepare("attach database ? as bk").run(path.join(BACKUP_DIR, name));
+    db.prepare("attach database ? as bk").run(full);
     try {
       db.transaction(() => {
         for (const t of RESTORE_TABLES) {
@@ -1717,9 +1854,108 @@ app.get("/api/payroll-report", need(), (q, s) => {
   });
   s.json({ month, workers });
 });
+app.get(["/health", "/api/health"], (q, s) => {
+  try {
+    const ok = db.prepare("select 1 as ok").get();
+    s.json({ status: "ok", uptime: Math.floor(process.uptime()), db: !!ok });
+  } catch (e) {
+    s.status(500).json({ status: "error", error: e.message });
+  }
+});
+
+// ---- Stations: sign-up, entry, and the owner's data rights
+app.post("/api/stations", (q, s) => {
+  if (process.env.SIGNUP_ENABLED !== "1") return s.status(404).json({ error: "Station sign-up is not open." });
+  const b = q.body || {};
+  const slug = String(b.slug || "").trim().toLowerCase();
+  if (!/^[a-z0-9-]{3,30}$/.test(slug) || ["www", "api", "admin", "app"].includes(slug)) return s.status(400).json({ error: "Station address: use 3 to 30 letters, digits or hyphens." });
+  if (REG.prepare("select 1 from stations where slug=?").get(slug)) return s.status(400).json({ error: "That station address is taken." });
+  const name = String(b.name || "").trim();
+  if (!name) return s.status(400).json({ error: "Enter the station name." });
+  if (b.consent !== true) return s.status(400).json({ error: "Please accept the privacy notice to continue." });
+  const ownerName = String(b.owner_name || "").trim(), m = mob(b.mobile), pw = String(b.password || "");
+  const e = checkUser(ownerName, m, pw);
+  if (e) return s.status(400).json({ error: e });
+  if (!fs.existsSync(TEMPLATE_DB)) ensureTemplate();
+  fs.copyFileSync(TEMPLATE_DB, path.join(STATIONS_DIR, slug + ".db"));
+  const row = { slug, name, status: "active" };
+  const sd = openStationDb(slug);
+  const id = sd.prepare("insert into users(name,mobile,hash,role) values(?,?,?,'owner')").run(ownerName, m, bcrypt.hashSync(pw, 10)).lastInsertRowid;
+  REG.prepare("insert into stations(slug,name,status,owner_mobile,created,consent_at,notice_version) values(?,?,'active',?,?,?,?)").run(slug, name, m, now(), now(), String(b.notice_version || "1"));
+  let token = "";
+  als.run({ db: sd, station: row }, () => { token = startSession(q, s, id); });
+  const isSecure = q.secure || q.headers["x-forwarded-proto"] === "https";
+  const cookieOpts = isSecure ? "SameSite=None; Secure; Partitioned" : "SameSite=Lax";
+  const stnCookie = `ps_station=${slug}; HttpOnly; ${cookieOpts}; Path=/; Max-Age=${30 * DAY}`;
+  s.setHeader("Set-Cookie", [].concat(s.getHeader("Set-Cookie") || [], stnCookie));
+  s.json({ ok: true, slug, user: { id, name: ownerName, mobile: m, role: "owner" }, token });
+});
+app.post("/api/station/leave", (q, s) => {
+  const isSecure = q.secure || q.headers["x-forwarded-proto"] === "https";
+  const cookieOpts = isSecure ? "SameSite=None; Secure; Partitioned" : "SameSite=Lax";
+  s.setHeader("Set-Cookie", [
+    `ps_station=; HttpOnly; ${cookieOpts}; Path=/; Max-Age=0`,
+    `sid=; HttpOnly; ${cookieOpts}; Path=/; Max-Age=0`
+  ]);
+  s.json({ ok: true });
+});
+app.post("/api/station/enter", (q, s) => {
+  const slug = String((q.body && q.body.slug) || "").trim().toLowerCase();
+  const row = REG.prepare("select * from stations where slug=?").get(slug);
+  if (!row || row.status !== "active") return s.status(404).json({ error: "Station not found." });
+  const isSecure = q.secure || q.headers["x-forwarded-proto"] === "https";
+  const cookieOpts = isSecure ? "SameSite=None; Secure; Partitioned" : "SameSite=Lax";
+  s.setHeader("Set-Cookie", [`ps_station=${slug}; HttpOnly; ${cookieOpts}; Path=/; Max-Age=${30 * DAY}`]);
+  s.json({ ok: true, name: row.name, slug });
+});
+app.get("/api/station/export", need("owner"), (q, s) => {
+  const st = als.getStore() || {};
+  s.json({ station: st.station ? { slug: st.station.slug, name: st.station.name, created: st.station.created } : null, exported: now(), users: db.prepare("select id,name,mobile,role from users").all(), state: stateNow() });
+});
+app.post("/api/station/delete-request", need("owner"), (q, s) => {
+  const st = als.getStore() || {};
+  if (!st.station) return s.status(400).json({ error: "No station." });
+  REG.prepare("update stations set status='pending_deletion', deletion_requested=? where slug=?").run(now(), st.station.slug);
+  s.json({ ok: true, message: "Deletion requested. The station is closed and its data is deleted after the retention period." });
+});
+
+// ---- Platform admin (super admin): registry only, never a station database
+require("./admin").mount(app, { REG, bcrypt, stationsDir: STATIONS_DIR, publicDir: path.join(__dirname, "public") });
+
 app.use(express.static(path.join(__dirname, "public")));
 app.use("/api", (q, s) => s.status(404).json({ error: "Not found." }));
 app.use((err, q, s, n) => s.status(err.status || 500).json({ error: err.status === 400 ? "Invalid request." : "Something went wrong." }));
 
-setInterval(() => db.prepare("delete from sessions where exp<?").run(now()), 3600e3).unref();
-app.listen(PORT, HOST, () => console.log(`Petrol pump server on http://${HOST}:${PORT}`));
+setInterval(() => {
+  try { db.prepare("delete from sessions where exp<?").run(now()); } catch(e){}
+  try {
+    REG.prepare("select slug from stations").all().forEach((r) => openStationDb(r.slug).prepare("delete from sessions where exp<?").run(now()));
+  } catch(e){}
+}, 3600e3).unref();
+
+if (process.env.INIT_ONLY) {
+  defaultDb.pragma("wal_checkpoint(TRUNCATE)");
+  defaultDb.close();
+  process.exit(0);
+}
+ensureTemplate();
+
+const server = app.listen(PORT, HOST, () => console.log(`Petrol pump server on http://${HOST}:${PORT}`));
+
+function shutdown(signal) {
+  console.log(`Received ${signal}, shutting down gracefully...`);
+  server.close(() => {
+    try {
+      db.pragma("wal_checkpoint(TRUNCATE)");
+      db.close();
+      console.log("Database checkpointed and closed cleanly.");
+    } catch (e) {
+      console.error("Error during database close:", e.message);
+    }
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(1), 5000).unref();
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));

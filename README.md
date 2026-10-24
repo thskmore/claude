@@ -10,11 +10,27 @@ Node.js + SQLite backend with logins (owner, manager, worker), shared business d
 
 | Role | Can do |
 |---|---|
-| Owner | Everything: Pump setup, Salary, Team (managers and workers), approving the business day |
+| Owner | Everything: Pump setup, Salary, Team (managers, accountants, and workers), approving the business day |
 | Manager | Assigns duties, reviews and closes them, closes the business day, daily summary, ledger, stock and shop sales, suppliers, tanks, reports. Can add and manage workers in Team. No Pump setup, no Salary |
+| Accountant | Financial oversight: Ledger, Cash flow, Books, Expenses, Day reports, Salary register & reports, Reconcile, ATG & tank registers. Read-only for duties and pump configuration |
 | Worker | Their assigned duty, credit sales, tank dips, and their own pay. Can open the full detail of their past duties |
 
 Worker credit sales appear in the customer ledger immediately. If a sale is over the customer's available credit, it is held as "waiting for approval" instead. Managers and the owner see it at the top of the Ledger tab and can approve it (it then posts to the ledger) or reject it. The worker sees the status on their screen.
+
+## Architecture & Multi-Tenancy Scope
+
+This system is deliberately architected for **single-pump (single-station) operation**:
+- A single SQLite database (`data.db`) holds the station's nozzles, tanks, credit ledger, duties, day closures, and staff.
+- Business configuration (state table row with ID 1) contains single station parameters (tanks, nozzles, rates, modes).
+- All relational tables (`duties`, `days`, `dips`, `credit_sales`, `pay_rates`, `pay_items`, `users`, `audit`) are unscoped by tenant.
+
+### Future Multi-Pump Migration Roadmap
+If multi-tenancy / multi-outlet management is required in the future:
+1. **Schema Extension**: Add a `pump_id TEXT NOT NULL REFERENCES pumps(id)` column (or integer foreign key) to all domain tables: `users`, `duties`, `days`, `day_checks`, `dips`, `credit_sales`, `audit`, `licences`, `atg_readings`, `pay_rates`, `pay_items`, `duty_expenses`, and `shop_sales`.
+2. **State Partitioning**: Change the `state` table to key by `(pump_id, id)`.
+3. **Compound Uniqueness Constraints**: Update constraints such as `unique(tank_id, bd)` in ATG readings or `primary key(d, mode)` in `day_checks` to include `pump_id`.
+4. **Session Context**: Extend session tokens to bind to an active `pump_id` or allow multi-pump owners to switch station context via an `X-Pump-ID` header.
+5. **Authorization Middleware**: Update `need()` to enforce row-level tenant filtering (`where pump_id = ?`) across every database query.
 
 ## Duty flow
 
@@ -362,6 +378,29 @@ Each sub-tab opens the same screen as before. The owner sees every group; the ma
 ## OMC colour sets
 
 The theme list includes six oil marketing company (OMC) colour sets: IndianOil, BPCL, HPCL, Nayara Energy, Jio-bp and Shell. Each uses its primary colour for buttons and the active tab, and its secondary colour as an underline on the active tab. The text on buttons and the focus ring switch to black or white so they stay readable. These are colour settings for the app only. They are not official paint or signage specifications for any petrol station.
+
+## Multi-station
+
+Each station has its own database file in `stations/` (listed in `registry.db`) and its own backup folder. Every request is sent to one station only, so one station cannot see another's data or backups.
+
+- **Turn it on** with `SIGNUP_ENABLED=1`. The app then asks for a station address, or lets a new station register. Use this on a fresh deployment: in this mode the single-station `data.db` is not used.
+- **Choosing a station:** by address, on one shared domain. Staff can use the link `https://your-domain/?station=<address>`. The owner gets it from the **Staff link** button in the top bar and can share it on WhatsApp.
+- **Registering a station:** station name, a unique station address (3 to 30 letters, digits or hyphens), the owner's name, mobile and password, and consent to the privacy notice.
+- **Owner's data rights** (Pump setup, Backup step): **Export all data** (JSON) and **Delete my station**, which closes the station straight away and records the request.
+- **Backups:** the nightly backup covers every active station and keeps 30 per station. Restore only works inside the station.
+- **Settings:** `SIGNUP_ENABLED`, `DATA_DIR` (registry and station databases), `PRIVACY_CONTACT` (shown in the privacy notice), `BASE_DOMAIN` (optional sub-domain mode, not needed for the shared address), `BACKUP_ANYTIME` (testing only).
+- **Privacy notice:** the text in the app is a draft. Have a lawyer review it, and set `PRIVACY_CONTACT`, before you launch.
+- **Not built yet:** mobile verification, sign-up rate limits, encryption of the database files, deleting a closed station's data after the retention period, and billing.
+
+## Super admin (platform operator)
+
+The super admin is for the person who runs the service. It is separate from every station login.
+
+- **Create the first one on the server:** `node create-admin.js` (or `npm run create-admin`). It asks for a name, a mobile number and a password (10 or more characters, with a letter and a digit; what you type is not shown). If you set `DATA_DIR` for the server, set the same value when you run it. It can only be created this way, never from a web page, so nobody can claim it by finding the page first.
+- **Log in** at `https://your-domain/admin`. The login has its own cookie or Bearer token, which is only sent to the admin routes. A session lasts 8 hours, and 5 wrong tries lock that mobile number for 15 minutes.
+- **What an admin can do:** see every station (name, address, status, owner mobile, when the privacy notice was accepted, size of the data file); suspend or reactivate a station, with a reason that is logged; add or remove other admins (their own password is needed); change their own password (their other devices are logged out); and read the last 100 admin actions.
+- **What an admin cannot do:** open a station's business data. No admin route touches a station database, and there is no way to log in as a station user. A station that has asked to be deleted cannot be reactivated by an admin.
+- **If every admin password is lost,** run `node create-admin.js` again on the server to create a new admin.
 
 ## Try it on your computer
 

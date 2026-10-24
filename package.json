@@ -5,10 +5,11 @@
   "main": "server.js",
   "scripts": {
     "dev": "node server.js",
-    "build": "node --check server.js registers.js",
-    "lint": "node --check server.js registers.js",
+    "build": "node --check server.js registers.js admin.js",
+    "lint": "node --check server.js registers.js admin.js",
     "start": "node server.js",
-    "test": "node --test tests/registers.test.js tests/registers.property.test.js"
+    "test": "node --test tests/registers.test.js tests/registers.property.test.js",
+    "create-admin": "node create-admin.js"
   },
   "keywords": [],
   "author": "",
